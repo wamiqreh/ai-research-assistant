@@ -11,6 +11,8 @@ A deep research assistant that uses AI agents to plan web searches, gather infor
 
 Built with the [OpenAI Agents SDK](https://openai.github.io/openai-agents-python/), Gradio for the UI, and SendGrid for email delivery.
 
+[Live Demo](https://huggingface.co/spaces/Wamiqreh/ai-research-assistant)
+
 ## Prerequisites
 
 - Python 3.10+
