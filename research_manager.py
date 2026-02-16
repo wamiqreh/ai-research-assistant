@@ -4,10 +4,11 @@ import asyncio
 import json
 from typing import Any
 
-from agents import Agent, Runner, function_tool, RunContextWrapper, trace, gen_trace_id
+from agents import Agent, Runner, RunConfig, function_tool, handoff, RunContextWrapper, trace, gen_trace_id
+from agents.extensions.handoff_prompt import RECOMMENDED_PROMPT_PREFIX
 
 from search_agent import search_agent
-from clarifier_agent import clarifier_agent, Clarifications
+from clarifier_agent import clarifier_agent
 from planner_agent import (
     PlannerInput,
     build_planner_prompt,
@@ -20,10 +21,15 @@ from email_agent import email_agent
 
 
 class ResearchContext:
-    """Context passed through the run; holds progress queue for UI updates."""
+    """Context passed through the run; holds progress queue and trace_id for a single trace."""
 
-    def __init__(self, progress_queue: asyncio.Queue[str] | None = None):
+    def __init__(
+        self,
+        progress_queue: asyncio.Queue[str] | None = None,
+        trace_id: str | None = None,
+    ):
         self.progress_queue = progress_queue
+        self.trace_id = trace_id
 
 
 def _emit_progress(ctx: RunContextWrapper[ResearchContext] | None, message: str) -> None:
@@ -34,19 +40,25 @@ def _emit_progress(ctx: RunContextWrapper[ResearchContext] | None, message: str)
             pass
 
 
+def _run_config(ctx: RunContextWrapper[ResearchContext] | None) -> RunConfig | None:
+    """RunConfig so nested Runner.run calls use the same trace."""
+    if ctx and ctx.context and ctx.context.trace_id:
+        return RunConfig(trace_id=ctx.context.trace_id)
+    return None
+
+
+# --- Handoffs: progress on transfer ---
+
+
+def _on_handoff_to_clarifier(ctx: RunContextWrapper[ResearchContext] | None) -> None:
+    _emit_progress(ctx, "Asking a few questions to focus the research…")
+
+
+def _on_handoff_to_email(ctx: RunContextWrapper[ResearchContext] | None) -> None:
+    _emit_progress(ctx, "Sending email…")
+
+
 # --- Tools that wrap sub-agents and report progress ---
-
-
-@function_tool
-async def get_clarifications(
-    ctx: RunContextWrapper[ResearchContext],
-    query: str,
-) -> str:
-    """Get 2–3 clarifying questions to ask the user for this research query. Call this first when the user has not yet answered any clarifying questions."""
-    _emit_progress(ctx, "Thinking of a few questions to better focus the research...")
-    result = await Runner.run(clarifier_agent, query)
-    clarifications = result.final_output_as(Clarifications)
-    return json.dumps({"questions": clarifications.questions})
 
 
 @function_tool
@@ -55,14 +67,14 @@ async def plan_searches(
     query: str,
     questions_and_answers: str,
 ) -> str:
-    """Create a search plan from the main query and the user's answers to clarifying questions. Input must be JSON: {\"questions\": [...], \"answers\": [...]}."""
+    """Create a search plan from the main query and the user's answers to clarifying questions. Input must be JSON: {"questions": [...], "answers": [...]}. Extract questions and answers from the conversation if the user was asked by the Clarifier agent."""
     _emit_progress(ctx, "Planning web searches...")
     data = json.loads(questions_and_answers)
     questions = data.get("questions", [])
     answers = data.get("answers", [])
     input_data = PlannerInput(query=query, clarifications=questions, answers=answers)
     prompt = build_planner_prompt(input_data)
-    result = await Runner.run(planner_agent, prompt)
+    result = await Runner.run(planner_agent, prompt, run_config=_run_config(ctx))
     plan = result.final_output_as(WebSearchPlan)
     return plan.model_dump_json()
 
@@ -81,6 +93,7 @@ async def run_search(
         result = await Runner.run(
             search_agent,
             f"Search term: {search_term}\nReason for searching: {reason}",
+            run_config=_run_config(ctx),
         )
         return str(result.final_output)
     except Exception:
@@ -97,34 +110,24 @@ async def write_report(
     _emit_progress(ctx, "Writing report...")
     results = json.loads(search_results_json)
     input_text = f"Original query: {query}\nSummarized search results: {results}"
-    result = await Runner.run(writer_agent, input_text)
+    result = await Runner.run(writer_agent, input_text, run_config=_run_config(ctx))
     report_data = result.final_output_as(ReportData)
     return report_data.model_dump_json()
 
 
-@function_tool
-async def send_report_email(
-    ctx: RunContextWrapper[ResearchContext],
-    markdown_report: str,
-) -> str:
-    """Send the final report by email. Call this after write_report."""
-    _emit_progress(ctx, "Sending email...")
-    await Runner.run(email_agent, markdown_report)
-    return "Email sent."
+MANAGER_INSTRUCTIONS = f"""You are a research coordinator. You help the user get a deep research report on a topic.
 
-
-MANAGER_INSTRUCTIONS = """You are a research coordinator. You help the user get a deep research report on a topic.
+{RECOMMENDED_PROMPT_PREFIX}
 
 Flow:
-1. When the user first gives a research query, use get_clarifications to get 2–3 short questions. Then ask the user those questions in a natural, conversational way (one message). Do not list "Question 1", "Question 2" mechanically—phrase them as a friendly assistant would.
-2. When the user has answered (in the same chat), use plan_searches with the original query and their answers (pass questions and answers as JSON: {"questions": [...], "answers": [...]}).
+1. When the user first gives a research query, transfer to the Clarifier agent so they can ask 2–3 clarifying questions in a natural way. When the user has answered, you will get control back.
+2. When you have the user's answers (from the conversation after the Clarifier handed back), use plan_searches with the original query and their answers. Pass JSON: {{"questions": [...], "answers": [...]}}. You can infer the questions from what the Clarifier asked, or use short placeholders.
 3. For each search in the plan, call run_search with search_term, reason, and progress_label like "Search 2/5".
 4. Call write_report with the query and all search result strings as a JSON array.
-5. Call send_report_email with the markdown_report from the write_report output.
-6. Reply to the user with the full report in markdown (the markdown_report from write_report). That is your final response.
+5. When the report is ready, transfer to the Email agent so they can send it. Include the full report (markdown_report from write_report) in your message when you transfer. When they hand back, reply to the user with the full report in markdown so they see it in the chat.
 
-If the user has already provided answers to your clarifying questions in the conversation, skip step 1 and go straight to planning and searching. Use the full conversation to extract the original query and the user's answers.
-Always return the full report at the end so the user sees it in the chat."""
+If the user has already provided answers to clarifying questions in the conversation, skip step 1 and go straight to planning and searching. Use the full conversation to extract the original query and the user's answers.
+Always show the full report to the user at the end."""
 
 
 research_manager_agent = Agent(
@@ -132,13 +135,25 @@ research_manager_agent = Agent(
     instructions=MANAGER_INSTRUCTIONS,
     model="gpt-4o-mini",
     tools=[
-        get_clarifications,
         plan_searches,
         run_search,
         write_report,
-        send_report_email,
+    ],
+    handoffs=[
+        handoff(
+            agent=clarifier_agent,
+            on_handoff=_on_handoff_to_clarifier,
+        ),
+        handoff(
+            agent=email_agent,
+            on_handoff=_on_handoff_to_email,
+        ),
     ],
 )
+
+# Hand back to manager when clarifier or email agent are done
+clarifier_agent.handoffs = [research_manager_agent]
+email_agent.handoffs = [research_manager_agent]
 
 
 async def run_research(
@@ -153,7 +168,7 @@ async def run_research(
     report_markdown is the final report if one was produced, else "".
     """
     trace_id = gen_trace_id()
-    ctx = ResearchContext(progress_queue=progress_queue)
+    ctx = ResearchContext(progress_queue=progress_queue, trace_id=trace_id)
 
     # Build input: previous turns as history + new user message
     input_items: list[Any] = []
@@ -187,6 +202,7 @@ async def run_research(
             input_str,
             context=ctx,
             max_turns=30,
+            run_config=RunConfig(trace_id=trace_id),
         )
 
     final_output = result.final_output
